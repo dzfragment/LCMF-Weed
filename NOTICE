@@ -1,0 +1,20 @@
+MultiFrameYOLO
+=============
+
+Multi-frame fused weed/root-point detection built on a PyTorch
+YOLOv8-pose re-implementation.
+
+The following parts are derived from third-party open-source software:
+
+* `YOLOv8-pose/` (nets/, utils/, main.py) is a modified copy of
+  jahongir7174/YOLOv8-pose
+  (https://github.com/jahongir7174/YOLOv8-pose), itself a PyTorch
+  re-implementation of Ultralytics YOLOv8-pose. Upstream license:
+  GNU Affero General Public License v3.0.
+
+The rest of this repository (multi-frame fusion model, training and
+evaluation code) is distributed under the same AGPL-3.0 license that
+covers the derived base, as stated in the top-level LICENSE file.
+
+Original copyright and license notices of the upstream project are
+preserved in `YOLOv8-pose/LICENSE`.

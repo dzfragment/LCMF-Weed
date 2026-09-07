@@ -1,0 +1,12 @@
+# Runtime dependencies
+
+# Core
+torch>=2.0
+torchvision
+numpy
+opencv-python
+PyYAML
+tqdm
+
+# Dev / tests (optional)
+pytest

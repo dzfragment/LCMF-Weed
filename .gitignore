@@ -1,0 +1,28 @@
+# 忽略 Python 缓存与本地产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# 权重与日志（训练产物，不进入版本库；需要发布请用 GitHub Release）
+*.pt
+*.pth
+*.log
+*.swp
+*.swo
+
+# 实验输出目录（本地训练/评测产物）
+results/
+pilot_results/
+supplement_pilot_results/
+smoke_test_output/
+test_results/
+viz_*/
+dcn_analysis*/
+poseap_batch_results/
+.training_status
+
+# 数据集一律放在仓库外（见各 README 的 DATASET_ROOT 约定）
+datasets/
+weed_*/
+weed1024/
