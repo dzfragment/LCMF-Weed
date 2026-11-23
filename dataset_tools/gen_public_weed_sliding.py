@@ -68,7 +68,7 @@ if not _DATA_ROOT:
     raise SystemExit('[dataset_tools] 请设置环境变量 WEED_EXP_ROOT：实验数据集根目录（旧 exp2：'
                      'weed1024 / public_weed_le256_* / weed_public_* / weed_sliding_merged 等所在）')
 
-SRC_ROOT = os.path.join(_DATA_ROOT, 'public_weed_le256_split')
+SRC_ROOT = os.path.join(_DATA_ROOT, 'public_weed_le256_split_1021')
 OUT_ROOT = os.path.join(_DATA_ROOT, 'weed_public_sliding')
 
 # ═══ 新数据集滑动规则 ═══
@@ -262,6 +262,10 @@ def process_single_image(img, labels, samples_target, seq_idx, dst_dir, rng,
             else:
                 blur_f2 = False
 
+        # common.apply_* 使用全局 random；按 seq_idx 固定种子保证可复现
+        random.seed(SEED_BASE + seq_idx)
+        common.CURRENT_OCC_MODE = rng.choices(
+            ['key_only', 'refs_only', 'all'], weights=[0.5, 0.1, 0.4])[0]
         frame0_n = apply_noises(frame0, 0, labels_f0, oe_params, blur_flag=blur_f0,
                                 label_occ_area_ratio=f0_label_occ_area_ratio,
                                 label_occ_max_size=f0_label_occ_max_size,
@@ -294,6 +298,10 @@ def process_single_image(img, labels, samples_target, seq_idx, dst_dir, rng,
 # ══════════════════════════════════════════════════════════════════════
 
 def main(split_only=None):
+    bank_path = os.environ.get('OCCLUDER_BANK')
+    if bank_path and os.path.exists(bank_path):
+        common.set_patch_bank(np.load(bank_path))
+        print(f'[occluder] patch bank: {bank_path}')
     print("=" * 60)
     print("CropAndWeed 子集滑动窗口多帧生成(单独规则)")
     print(f"  源图 {SRC_W}×{SRC_H} | 窗口 {FRAME_SIZE} | "

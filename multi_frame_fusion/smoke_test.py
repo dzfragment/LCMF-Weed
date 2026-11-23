@@ -31,19 +31,29 @@ from models.mf_yolo import MultiFrameYOLO
 from mf_dataset import MultiFrameDataset
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+BASE_MODEL = os.environ.get('BASE_MODEL', 'p2l_p4')
 OUT_DIR = os.path.join(_SCRIPT_DIR, 'smoke_test_output')
-os.makedirs(OUT_DIR, exist_ok=True)
+__test__ = False  # Run the dependent checks through main().
+
+
+def _pretrained_path():
+    names = {
+        'p2l': 'yolo_v8_n_p2_lite',
+        'p2l_p4': 'yolo_v8_n_p2_lite_p4',
+        'p34l': 'yolo_v8_n_p34_lite',
+    }
+    name = names.get(BASE_MODEL, 'yolo_v8_n_p34_lite')
+    return os.path.join(_WORKSPACE,
+                        f'experiments/single_frame_baseline/results/weed_merged_1024/{name}/seed42/best.pt')
 
 
 def test_model_creation():
     """测试1: 模型创建"""
     print('=' * 60)
-    print('[测试1] 模型创建')
+    print(f'[测试1] 模型创建 (base_model={BASE_MODEL})')
     print('=' * 60)
 
-    pretrained_path = os.path.join(
-        _WORKSPACE,
-        'experiments/single_frame_baseline/results/yolo_v8_n_p2_lite_p4/seed42/best.pt')
+    pretrained_path = _pretrained_path()
 
     if not os.path.exists(pretrained_path):
         print(f'  警告: 预训练权重不存在 {pretrained_path}')
@@ -55,6 +65,7 @@ def test_model_creation():
         kpt_shape=(1, 2),
         fusion_levels=['p4'],
         pretrained_path=pretrained_path,
+        base_model=BASE_MODEL,
     )
     model = model.to(DEVICE)
 
@@ -96,7 +107,7 @@ def test_forward_shape(model):
 
     # 检查 backbone 特征 shape
     print('\n  --- Backbone 特征 ---')
-    for level in ['p2', 'p3', 'p4']:
+    for level in model.feature_levels:
         s = features['key'][level].shape
         print(f'  key_{level}: {s}  (ch={s[1]}, spatial={s[2]}×{s[3]})')
 
@@ -108,7 +119,7 @@ def test_forward_shape(model):
 
     # 检查融合后特征 shape
     print('\n  --- 融合后特征 ---')
-    for level in ['p2', 'p3', 'p4']:
+    for level in model.feature_levels:
         s = features['fused'][level].shape
         print(f'  fused_{level}: {s}')
 
@@ -127,12 +138,13 @@ def test_forward_shape(model):
     else:
         print(f'  output: {outputs.shape}')
 
-    # 验证预期 shape
+    # 验证预期 shape（256 输入下）
     expected = {
         'p2': (1, 32, 64, 64),
         'p3': (1, 64, 32, 32),
         'p4': (1, 128, 16, 16),
     }
+    expected = {lv: expected[lv] for lv in model.feature_levels}
     all_ok = True
     for level, exp_shape in expected.items():
         actual = features['key'][level].shape
@@ -160,8 +172,9 @@ def test_fusion_attention(model, features):
         ref1_feats = model.backbone(dummy[:, 1])
         ref2_feats = model.backbone(dummy[:, 2])
 
+    p4_idx = model.level_to_idx['p4']
     level_to_feats = {
-        'p4': (key_feats[2], ref1_feats[2], ref2_feats[2]),
+        'p4': (key_feats[p4_idx], ref1_feats[p4_idx], ref2_feats[p4_idx]),
     }
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 3))
@@ -267,7 +280,8 @@ def test_real_data(model):
     print('[测试5] 真实数据前向传播')
     print('=' * 60)
 
-    dataset_root = os.environ.get('DATASET_ROOT') or os.path.join(_WORKSPACE, 'datasets', 'demo_mf')
+    data_root = os.environ.get('LCMF_DATA_ROOT', os.path.join(_WORKSPACE, 'dataset'))
+    dataset_root = os.environ.get('DATASET_ROOT', os.path.join(data_root, 'weed_sliding_merged'))
     if not os.path.exists(dataset_root):
         print(f'  ✗ 数据集不存在: {dataset_root}')
         return False
@@ -379,9 +393,8 @@ def test_fft_align_variant(model):
     model_copy = MultiFrameYOLO(
         num_classes=1, kpt_shape=(1, 2),
         fusion_levels=['p4'],
-        pretrained_path=os.path.join(
-            _WORKSPACE,
-            'experiments/single_frame_baseline/results/yolo_v8_n_p2_lite_p4/seed42/best.pt'),
+        pretrained_path=_pretrained_path(),
+        base_model=BASE_MODEL,
     ).to(DEVICE)
     apply_fft_image_align(model_copy, downsample=8)
     model_copy.eval()
@@ -399,6 +412,7 @@ def test_fft_align_variant(model):
 
 
 def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
     print('MultiFrameYOLO 冒烟测试')
     print(f'Device: {DEVICE}')
     print(f'输出目录: {OUT_DIR}')

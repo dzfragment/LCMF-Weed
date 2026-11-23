@@ -1,0 +1,11 @@
+{
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "arms": [
+    "13_fusion_avg"
+  ],
+  "reference_suite": "../concat_core_multiseed_20261111"
+}

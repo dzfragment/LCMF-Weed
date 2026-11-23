@@ -20,6 +20,56 @@ from config import (
 )
 from common import load_labels, save_labels
 
+import re
+
+
+def get_group_key(basename):
+    """与 common.get_group_key / stage2_sliding 相同的分组规则。"""
+    m = re.match(r'(frame_\d{2})-\d{2}-\d{2}$', basename)
+    if m:
+        return f'video_{m.group(1)}'
+    m = re.match(r'image_(\d{8})_\d{6}_\d{4}$', basename)
+    if m:
+        return f'session_{m.group(1)}'
+    m = re.match(r'(ave|vwg)-(\d{4})-\d{4}$', basename)
+    if m:
+        return f'public_{m.group(1)}_{m.group(2)}'
+    return f'single_{basename}'
+
+
+def assign_groups_like_stage2_sliding(weed_dir):
+    """复现 stage2_sliding 的组级划分（video→train; session 按大小降序取 3/2/1 分;
+    single 5/5/5, seed 42）。组大小统计基于全部三集合, 与多帧划分完全一致。
+
+    目的: 单帧基座(weed1024)的训练内容 ⊆ 多帧数据集的训练内容,
+    消除「基座预训练见过多帧 val/test 内容」的泄露。"""
+    all_groups = {}
+    for sp in ['train', 'val', 'test']:
+        img_dir = os.path.join(weed_dir, sp, 'images')
+        for f in os.listdir(img_dir):
+            if not f.endswith(('.jpg', '.png', '.JPG', '.PNG')):
+                continue
+            base = os.path.splitext(f)[0]
+            all_groups.setdefault(get_group_key(base), []).append(base)
+
+    np.random.seed(42)
+    video_groups = sorted(k for k in all_groups if k.startswith('video_'))
+    session_groups = sorted(k for k in all_groups if k.startswith('session_'))
+    single_groups = sorted(k for k in all_groups if k.startswith('single_'))
+    assert len(video_groups) == 1 and len(session_groups) == 6 and len(single_groups) == 15, \
+        (f'组结构与预期不符: video={len(video_groups)} session={len(session_groups)} '
+         f'single={len(single_groups)}')
+
+    split_of_group = {k: 'train' for k in video_groups}
+    sess_sorted = sorted(session_groups, key=lambda k: len(all_groups[k]), reverse=True)
+    for i, k in enumerate(sess_sorted):
+        split_of_group[k] = 'train' if i in (0, 1, 5) else ('val' if i in (2, 4) else 'test')
+    perm = np.random.permutation(len(single_groups))
+    for i, idx in enumerate(perm):
+        split_of_group[single_groups[idx]] = ('train' if i < 5 else
+                                              'val' if i < 10 else 'test')
+    return split_of_group
+
 
 def bbox_to_pixels(label, img_size):
     """将归一化标注转为像素坐标。
@@ -256,10 +306,10 @@ def create_visualization(output_dir, split_name, images_dir, labels_dir):
 def main():
     print("=" * 60)
     print("第一阶段：大图拆分 (Resize 2048 → 2×2 Split)")
-    print("  去重合并 train+val 后重新 80/20 划分")
+    print("  组级划分 (与多帧 stage2_sliding 同规则), 消除相邻帧跨split泄露")
     print("=" * 60)
 
-    # ---- 收集全部图片，去重 ----
+    # ---- 收集 stage1 可用图片（train+val 池, 去重）----
     all_images = {}  # basename → (src_images_dir, src_labels_dir)
     for img_dir, lbl_dir in [(TRAIN_IMAGES, TRAIN_LABELS), (VAL_IMAGES, VAL_LABELS)]:
         for f in os.listdir(img_dir):
@@ -270,21 +320,32 @@ def main():
                 all_images[base] = (img_dir, lbl_dir)
     print(f"去重后共 {len(all_images)} 张原图 (train+val 合并)")
 
-    # ---- 固定种子随机划分 80/20 ----
-    bases = sorted(all_images.keys())
-    np.random.seed(42)
-    perm = np.random.permutation(len(bases))
-    split_n = int(len(bases) * 0.8)
-    train_bases = set(bases[i] for i in perm[:split_n])
-    val_bases   = set(bases[i] for i in perm[split_n:])
-    print(f"划分: train {len(train_bases)} / val {len(val_bases)}")
+    # ---- 组级划分（与 stage2_sliding 完全同规则; 组大小统计含原始 test 集合）----
+    weed_dir = os.path.dirname(os.path.dirname(TRAIN_IMAGES))
+    split_of_group = assign_groups_like_stage2_sliding(weed_dir)
+
+    train_bases, val_bases, test_bases = set(), set(), set()
+    base_split = {}
+    for base in all_images:
+        s = split_of_group[get_group_key(base)]
+        base_split[base] = s
+        {'train': train_bases, 'val': val_bases, 'test': test_bases}[s].add(base)
+    print(f"划分(按组): train {len(train_bases)} / val {len(val_bases)} / test {len(test_bases)} 张源图")
+
+    # 组级纯净断言: 同一组的图片只能出现在一个 split
+    g_train = {get_group_key(b) for b in train_bases}
+    g_val = {get_group_key(b) for b in val_bases}
+    g_test = {get_group_key(b) for b in test_bases}
+    assert not (g_train & g_val) and not (g_train & g_test) and not (g_val & g_test), \
+        "BUG: 组级划分不纯净"
+    print("  ✓ 组级纯净检查通过 (同组图片不跨 split)")
 
     # ---- 处理 train ----
     print("\n[Train 拆分]")
     train_img_out = os.path.join(STAGE1_OUT, "train", "images")
     train_lbl_out = os.path.join(STAGE1_OUT, "train", "labels")
 
-    train_files = [(base, *all_images[base]) for base in train_bases]
+    train_files = [(base, *all_images[base]) for base in sorted(train_bases)]
     train_stats = _process_split_from_list(train_files, train_img_out, train_lbl_out)
 
     print(f"\n  Train 统计:")
@@ -293,14 +354,13 @@ def main():
     print(f"    原始标注: {train_stats['total_original_labels']}")
     print(f"    映射标注: {train_stats['total_mapped_labels']}")
     print(f"    丢弃标注总计: {train_stats['discarded_total']}")
-    print(f"    无标注图片: {train_stats['skipped_no_label']}")
 
     # ---- 处理 val ----
     print("\n[Val 拆分]")
     val_img_out = os.path.join(STAGE1_OUT, "val", "images")
     val_lbl_out = os.path.join(STAGE1_OUT, "val", "labels")
 
-    val_files = [(base, *all_images[base]) for base in val_bases]
+    val_files = [(base, *all_images[base]) for base in sorted(val_bases)]
     val_stats = _process_split_from_list(val_files, val_img_out, val_lbl_out)
 
     print(f"\n  Val 统计:")
@@ -309,12 +369,29 @@ def main():
     print(f"    原始标注: {val_stats['total_original_labels']}")
     print(f"    映射标注: {val_stats['total_mapped_labels']}")
     print(f"    丢弃标注总计: {val_stats['discarded_total']}")
-    print(f"    无标注图片: {val_stats['skipped_no_label']}")
+
+    # ---- 处理 test ----
+    print("\n[Test 拆分]")
+    test_img_out = os.path.join(STAGE1_OUT, "test", "images")
+    test_lbl_out = os.path.join(STAGE1_OUT, "test", "labels")
+
+    test_files = [(base, *all_images[base]) for base in sorted(test_bases)]
+    test_stats = _process_split_from_list(test_files, test_img_out, test_lbl_out)
+
+    print(f"\n  Test 统计:")
+    print(f"    输入图片: {test_stats['total_images']}")
+    print(f"    输出 tiles: {test_stats['total_tiles']}")
+    print(f"    原始标注: {test_stats['total_original_labels']}")
+    print(f"    映射标注: {test_stats['total_mapped_labels']}")
+    print(f"    丢弃标注总计: {test_stats['discarded_total']}")
 
     # 汇总
-    total_orig = train_stats['total_original_labels'] + val_stats['total_original_labels']
-    total_mapped = train_stats['total_mapped_labels'] + val_stats['total_mapped_labels']
-    total_discarded = train_stats['discarded_total'] + val_stats['discarded_total']
+    total_orig = sum(s['total_original_labels'] for s in
+                     (train_stats, val_stats, test_stats))
+    total_mapped = sum(s['total_mapped_labels'] for s in
+                       (train_stats, val_stats, test_stats))
+    total_discarded = sum(s['discarded_total'] for s in
+                          (train_stats, val_stats, test_stats))
     print(f"\n  汇总: {total_orig} 个标注 → {total_mapped} 个映射标注 "
           f"(丢弃 {total_discarded}, {total_discarded/max(total_orig,1)*100:.1f}%)")
 

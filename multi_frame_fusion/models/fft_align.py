@@ -15,6 +15,8 @@ FFT 对齐算法已拆分为独立包 ``fft_align``（本目录下的顶层包�
 依赖 MultiFrameYOLO 的 forward 结构，不属于纯对齐算法）。
 """
 
+import torch
+
 from fft_align import (
     FFTAlign,
     align_frame,

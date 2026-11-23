@@ -353,6 +353,7 @@ class ConsistentAligner:
         c20s = self._grad_corr_candidates_batch(ref2, key, self.k)
 
         dx1s, dy1s, dx2s, dy2s = [], [], [], []
+        res_list, mode_list = [], []
         for b in range(B):
             dx1, dy1, dx2, dy2, res, mode = self._solve_from_candidates(
                 c10s[b], c21s[b], c20s[b], image_hw=key.shape[-2:])
@@ -360,6 +361,11 @@ class ConsistentAligner:
             dy1s.append(dy1)
             dx2s.append(dx2)
             dy2s.append(dy2)
+            res_list.append(float(res))
+            mode_list.append(mode)
+        self.last_res = torch.tensor(res_list, dtype=torch.float32,
+                                     device=key.device)
+        self.last_modes = mode_list
 
         dx1 = torch.tensor(dx1s, dtype=torch.float32, device=key.device)
         dy1 = torch.tensor(dy1s, dtype=torch.float32, device=key.device)

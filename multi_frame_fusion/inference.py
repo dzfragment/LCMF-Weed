@@ -159,9 +159,13 @@ def load_model(checkpoint_path, pretrained_path=None):
             'experiments/single_frame_baseline/results/yolo_v8_n_p2_lite_p4/seed42/best.pt')
 
     ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
-    if ckpt.get('base_model') != 'p2l_p4':
+    if ckpt.get('pad_head', False):
         raise ValueError(
-            f'仅支持新版 P2L-P4 checkpoint，收到 base_model={ckpt.get("base_model")}')
+            'inference.py 还未接入 PAD 点热图解码; PAD checkpoint 请用 '
+            'train_pad_mf.py 的测试评估或 pad_core.decode_predictions')
+    base_model = ckpt.get('base_model', 'p2l_p4')
+    if base_model not in ('p2l', 'p2l_p4', 'p34l'):
+        raise ValueError(f'不支持的 checkpoint base_model={base_model}')
     fusion_levels = ckpt.get('fusion_levels')
     if fusion_levels not in (['p3'], ['p4'], ['p3', 'p4']):
         raise ValueError(
@@ -192,6 +196,7 @@ def load_model(checkpoint_path, pretrained_path=None):
         fusion_gate_type=fusion_gate_type,
         global_align_stage='feature' if global_align_stage == 'feature' else 'none',
         fft_downsample=fft_downsample,
+        base_model=base_model,
     )
     model = model.to(DEVICE)
     if dav2_single:

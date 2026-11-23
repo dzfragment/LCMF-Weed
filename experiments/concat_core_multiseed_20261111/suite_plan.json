@@ -1,0 +1,14 @@
+{
+  "seeds": [
+    43,
+    44
+  ],
+  "arms": [
+    "01_main",
+    "02_no_global_no_dcn",
+    "03_no_global",
+    "04_no_dcn",
+    "06_no_fft"
+  ],
+  "baseline_seed42": "../concat_ablation12_20261106"
+}

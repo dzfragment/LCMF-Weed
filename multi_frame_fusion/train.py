@@ -77,6 +77,37 @@ def apply_ablation(model, no_align=False, fusion_mode='gate_diff'):
     return model
 
 
+def apply_shared_offset(model, level, offset_reuse_mode=None):
+    """跨层复用 DCN offset：只在 level 层训练 offset predictor，
+    其余融合层用 OffsetReuseAlign（一次 DCN + 复用/缩放 offset）。
+
+    必须在加载 checkpoint 权重之前调用（会替换 align 模块）。
+    """
+    from models.modules import OffsetReuseAlign
+    if level in (None, '', 'none'):
+        return model
+    fusion = model.fusion
+    if getattr(fusion, 'fusion_version', 2) != 2:
+        raise ValueError('shared offset 仅支持 fusion_version=2')
+    if level not in fusion.fusion_levels:
+        raise ValueError(
+            f'shared offset level={level!r} 不在 fusion_levels={fusion.fusion_levels}')
+    if offset_reuse_mode is None:
+        offset_reuse_mode = getattr(fusion, 'offset_reuse_mode', 'bilinear')
+    fusion.shared_offset_level = level
+    fusion.offset_reuse_mode = offset_reuse_mode
+    device = next(model.parameters()).device
+    for l in fusion.fusion_levels:
+        if l == level:
+            continue
+        ch = fusion.fusion_channels[l]
+        fusion.align_ref1[l] = OffsetReuseAlign(
+            ch, reuse_mode=offset_reuse_mode).to(device)
+        fusion.align_ref2[l] = OffsetReuseAlign(
+            ch, reuse_mode=offset_reuse_mode).to(device)
+    return model
+
+
 def apply_cascade(model):
     """级联对齐: ref2 先对齐 ref1，ref1 再对齐 key。"""
     fusion = model.fusion
@@ -84,7 +115,7 @@ def apply_cascade(model):
     def cascade_forward(key_feats, ref1_feats, ref2_feats):
         fused = list(key_feats)
         for level in fusion.fusion_levels:
-            idx = LEVEL_TO_IDX[level]
+            idx = fusion.level_to_idx[level]
             key = key_feats[idx]
             ref1 = ref1_feats[idx]
             ref2 = ref2_feats[idx]
@@ -110,7 +141,7 @@ def apply_iterative_fusion(model):
     def iter_forward(key_feats, ref1_feats, ref2_feats):
         fused = list(key_feats)
         for level in fusion.fusion_levels:
-            idx = LEVEL_TO_IDX[level]
+            idx = fusion.level_to_idx[level]
             key = key_feats[idx]; ref1 = ref1_feats[idx]; ref2 = ref2_feats[idx]
 
             # Step 1: ref2 → ref1，增强 ref1
@@ -142,7 +173,7 @@ def apply_shared_cascade(model):
     def fwd(key_feats, ref1_feats, ref2_feats):
         fused = list(key_feats)
         for level in fusion.fusion_levels:
-            idx = LEVEL_TO_IDX[level]
+            idx = fusion.level_to_idx[level]
             key = key_feats[idx]; ref1 = ref1_feats[idx]; ref2 = ref2_feats[idx]
             a2 = fusion.align_ref1[level](ref2, ref1)
             # Step1: 纯 gate 加权，不用 proj，避免特征膨胀
@@ -180,7 +211,7 @@ def apply_two_frame(model):
     def two_frame_forward(key_feats, ref1_feats, ref2_feats):
         fused = list(key_feats)
         for level in fusion.fusion_levels:
-            idx = LEVEL_TO_IDX[level]
+            idx = fusion.level_to_idx[level]
             key = key_feats[idx]
             ref1 = ref1_feats[idx]
             # ref1 同时作为两个 ref 输入（ref2 路径等同 ref1）
@@ -192,6 +223,15 @@ def apply_two_frame(model):
         return tuple(fused)
 
     fusion.forward = two_frame_forward
+    # 对齐 loss 也要按两帧口径: forward 已把 ref2 路径替换成 ref1,
+    # 但 AlignLoss 仍会拿原始 ref2 特征算 loss; 这里同步覆盖, 避免训练
+    # 一个 forward 根本不用的 ref2 分支.
+    _orig_align_loss = fusion.get_alignment_loss
+
+    def two_frame_alignment_loss(key_feats=None, ref1_feats=None, ref2_feats=None):
+        return _orig_align_loss(key_feats, ref1_feats, ref1_feats)
+
+    fusion.get_alignment_loss = two_frame_alignment_loss
     return model
 
 from utils import util
@@ -231,6 +271,11 @@ def get_args():
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--fusion-levels', type=str, default='p4',
                    help='融合层：p3、p4 或 p3,p4；P2 因特征图过大不参与融合')
+    p.add_argument('--base-model', type=str, default='p2l_p4',
+                   choices=['p2l', 'p2l_p4', 'p34l'],
+                   help='单帧基座: p2l=P2/P3/P4 backbone+P3/P4双头; '
+                        'p2l_p4=P2/P3/P4 backbone+P4单头(原版); '
+                        'p34l=P3/P4 backbone+P3/P4双头')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--fusion-version', type=int, default=2, choices=[2, 3],
                    help='2=DeformAlignV2, 3=HybridAlign (PCD+DCNv2)')
@@ -334,10 +379,10 @@ def save_ckpt(model, optimizer, scheduler, scaler, ema, epoch,
         'fusion_gate_type': fusion_gate_type,
         'fft_chain_align': True,
         'fft_mse_check': True,
-        'base_model': 'p2l_p4',
-        'feature_levels': ['p2', 'p3', 'p4'],
+        'base_model': model.base_model,
+        'feature_levels': list(model.feature_levels),
         'fusion_levels': list(model.fusion_levels),
-        'detect_levels': ['p4'],
+        'detect_levels': list(model.detect_levels),
     }
     if ema is not None:
         # 直接 half + state_dict，避免 deepcopy
@@ -352,7 +397,7 @@ def load_ckpt(path, device='cuda', fusion_version=2, align_mode=None, fusion_lev
               convgru_kernel=3, convgru_layers=1,
               fft_feature_align=False, fft_downsample=4,
               fft_normalize=True, consistent_align=False,
-              dav2_single=False, dav2_triple=False):
+              dav2_single=False, dav2_triple=False, base_model='p2l_p4'):
     """加载 checkpoint：重建模型并恢复训练状态。state_dict 加载保证了 requires_grad=True。
     no_align / fusion_mode_ablation: 消融实验参数，必须在 load_state_dict 前应用。"""
     ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -373,15 +418,18 @@ def load_ckpt(path, device='cuda', fusion_version=2, align_mode=None, fusion_lev
     if fusion_levels is None:
         fusion_levels = ['p4']
     fusion_levels = list(fusion_levels)
-    if fusion_levels not in (['p3'], ['p4'], ['p3', 'p4']):
-        raise ValueError(f'仅支持 fusion_levels=p3、p4 或 p3,p4，收到 {fusion_levels}')
+    if fusion_levels not in (['p2'], ['p3'], ['p4'], ['p2', 'p3'],
+                             ['p3', 'p4'], ['p2', 'p4'],
+                             ['p2', 'p3', 'p4']):
+        raise ValueError(f'不支持的 fusion_levels={fusion_levels}')
     ckpt_levels = ckpt.get('fusion_levels')
     if ckpt_levels != fusion_levels:
         raise ValueError(
             f'Checkpoint fusion_levels={ckpt_levels} 与 CLI fusion_levels={fusion_levels} 不一致')
-    if ckpt.get('base_model') != 'p2l_p4':
+    ckpt_base = ckpt.get('base_model', 'p2l_p4')
+    if ckpt_base != base_model:
         raise ValueError(
-            f'仅支持新版 P2L-P4 checkpoint，收到 base_model={ckpt.get("base_model")}')
+            f'Checkpoint base_model={ckpt_base} 与 CLI base_model={base_model} 不一致')
 
     # 安全检查：checkpoint 版本与 CLI 不一致时始终警告
     if ckpt_fv is not None and ckpt_fv != fusion_version:
@@ -410,6 +458,7 @@ def load_ckpt(path, device='cuda', fusion_version=2, align_mode=None, fusion_lev
             fft_downsample=fft_downsample,
             fft_normalize=fft_normalize,
             consistent_align=consistent_align,
+            base_model=base_model,
         )
         model = model.to(device)
         apply_ablation(model, no_align=no_align, fusion_mode=fusion_mode_ablation)
@@ -623,7 +672,7 @@ class GateSparseLoss:
             ref2_feats = self.model._last_ref2_feats
             fusion = self.model.fusion
             for level in fusion.fusion_levels:
-                idx = LEVEL_TO_IDX[level]
+                idx = fusion.level_to_idx[level]
                 key = key_feats[idx]
                 ref1 = ref1_feats[idx]
                 ref2 = ref2_feats[idx]
@@ -681,7 +730,7 @@ class AlignLoss:
         count = 0
         aligned_r1, aligned_r2 = self.model.fusion.get_aligned_features()
         for level in self.model.fusion.fusion_levels:
-            idx = LEVEL_TO_IDX[level]
+            idx = self.model.fusion.level_to_idx[level]
             key = key_feats[idx]
             key_flat = F.normalize(key.view(key.size(0), key.size(1), -1), dim=2)
 
@@ -699,12 +748,18 @@ class AlignLoss:
 # 训练主流程
 # ═══════════════════════════════════════════════════════════
 
+def _dav2_replace_levels(model):
+    """共享 offset 时只替换共享层；否则替换所有融合层。"""
+    shared = getattr(model.fusion, 'shared_offset_level', None)
+    return [shared] if shared else list(model.fusion.fusion_levels)
+
+
 def apply_dav2_triple(model):
     """将所选融合层的标准 DAV2 替换为三阶段版本；须在严格加载权重前调用。"""
     from models.modules import DeformAlignV2Triple
-    for level in model.fusion.fusion_levels:
+    for level in _dav2_replace_levels(model):
         align1 = model.fusion.align_ref1[level]
-        if isinstance(align1, DeformAlignV2Triple):
+        if isinstance(align1, DeformAlignV2Triple) or not hasattr(align1, 's1_conv1'):
             continue
         ch = align1.s1_conv1.in_channels // 2
         hidden_ch = align1.s1_conv1.out_channels
@@ -719,14 +774,63 @@ def apply_dav2_triple(model):
 def apply_dav2_single(model):
     """将所选融合层的双阶段 DAV2 替换为单阶段版本；须在严格加载权重前调用。"""
     from models.modules import DeformAlignV2Single
-    for level in model.fusion.fusion_levels:
+    for level in _dav2_replace_levels(model):
         align1 = model.fusion.align_ref1[level]
-        if isinstance(align1, DeformAlignV2Single):
+        if isinstance(align1, DeformAlignV2Single) or not hasattr(align1, 's1_conv1'):
             continue
         ch = align1.s1_conv1.in_channels // 2
         device = next(model.parameters()).device
         model.fusion.align_ref1[level] = DeformAlignV2Single(ch).to(device)
         model.fusion.align_ref2[level] = DeformAlignV2Single(ch).to(device)
+
+
+def apply_dcn_variant(model, variant='v2'):
+    """Replace the shared DCN module with a structural variant (see dcn_variants).
+
+    Must run after apply_dav2_single / apply_shared_offset and before loading
+    weights.  Variants are functional supersets of V2 at initialisation.
+    """
+    if variant in (None, '', 'v2', 'none'):
+        return model
+    from models.dcn_variants import DeformAlignV2Adaptive, OffsetReuseAlignRefine
+
+    # Numeric aliases for common combinations.
+    alias = {'ms': 'coarse+dil2', 'ms_p2': 'coarse+dil2+p2refine'}
+    expr = alias.get(variant, variant)
+    tokens = [t for t in expr.split('+') if t]
+    align_tokens = [t for t in tokens if t in ('corr', 'k5', 'coarse', 'dil2', 'dil')]
+    want_p2 = 'p2refine' in tokens or 'p2' in tokens
+    unknown = set(tokens) - set(align_tokens) - {'p2refine', 'p2'}
+    if unknown:
+        raise ValueError(f'unknown dcn_variant={variant!r} (tokens={tokens})')
+    if not align_tokens and not want_p2:
+        raise ValueError(f'empty dcn_variant={variant!r}')
+
+    fusion = model.fusion
+    shared = getattr(fusion, 'shared_offset_level', None)
+    levels = [shared] if shared else list(fusion.fusion_levels)
+    device = next(model.parameters()).device
+
+    if align_tokens:
+        dag_variant = '+'.join(align_tokens)
+        for level in levels:
+            align1 = fusion.align_ref1[level]
+            ch = align1.s1_conv1.in_channels // 2
+            hidden = align1.s1_conv1.out_channels
+            fusion.align_ref1[level] = DeformAlignV2Adaptive(
+                ch, hidden_ch=hidden, variant=dag_variant).to(device)
+            fusion.align_ref2[level] = DeformAlignV2Adaptive(
+                ch, hidden_ch=hidden, variant=dag_variant).to(device)
+    if want_p2:
+        if 'p2' not in fusion.fusion_levels:
+            raise ValueError('p2refine requires p2 in fusion_levels')
+        for side in ('1', '2'):
+            align = getattr(fusion, f'align_ref{side}')
+            ch = fusion.fusion_channels['p2']
+            align['p2'] = OffsetReuseAlignRefine(
+                ch, reuse_mode=fusion.offset_reuse_mode).to(device)
+    model.dcn_variant = variant
+    return model
 
 
 def train(args):
@@ -744,12 +848,12 @@ def train(args):
             '--cascade-align 是普通特征级链式对齐，不能与 FFT/consistent/image '
             '全局预对齐同时开启')
 
-    # P2 不参与时序融合；允许比较 P3、P4 和 P3+P4。
+    # 默认 P3/P4；显式实验支持单层、双层、三层融合。
     fusion_levels = args.fusion_levels.split(',') if args.fusion_levels else ['p4']
-    if fusion_levels not in (['p3'], ['p4'], ['p3', 'p4']):
-        raise ValueError(
-            '当前模型只允许 --fusion-levels p3、p4 或 p3,p4，'
-            f'收到 {args.fusion_levels!r}')
+    if fusion_levels not in (['p2'], ['p3'], ['p4'], ['p2', 'p3'],
+                             ['p3', 'p4'], ['p2', 'p4'],
+                             ['p2', 'p3', 'p4']):
+        raise ValueError(f'不支持的 --fusion-levels {args.fusion_levels!r}')
     align_mode = None
     if args.align_mode:
         align_mode = {}
@@ -779,7 +883,8 @@ def train(args):
                                        fft_normalize=args.fft_normalize,
                                        consistent_align=args.consistent_align,
                                        dav2_single=args.dav2_single,
-                                       dav2_triple=args.dav2_triple)
+                                       dav2_triple=args.dav2_triple,
+                                       base_model=args.base_model)
         # Resume 后重新应用 cascade / image-align / fft-align（不在 checkpoint 中）
         if args.cascade_align:
             apply_cascade(model)
@@ -814,6 +919,7 @@ def train(args):
             fft_downsample=args.fft_downsample,
             fft_normalize=args.fft_normalize,
             consistent_align=args.consistent_align,
+            base_model=args.base_model,
         )
         model = model.to(device)
         apply_ablation(model, no_align=args.no_align, fusion_mode=args.fusion_mode)
@@ -878,6 +984,7 @@ def train(args):
             fft_downsample=args.fft_downsample,
             fft_normalize=args.fft_normalize,
             consistent_align=args.consistent_align,
+            base_model=args.base_model,
         )
         model = model.to(device)
         start_epoch = 0

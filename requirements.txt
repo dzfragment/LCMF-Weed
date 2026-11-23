@@ -1,12 +1,14 @@
-# Runtime dependencies
-
-# Core
+# Python 3.12+ is required by the real-blur and cross-frame experiment scripts.
 torch>=2.0
 torchvision
 numpy
 opencv-python
 PyYAML
 tqdm
+scipy
+matplotlib
+thop
+ultralytics==8.4.80
 
-# Dev / tests (optional)
+# Tests
 pytest

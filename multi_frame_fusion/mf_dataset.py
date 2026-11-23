@@ -313,8 +313,12 @@ class MultiFrameDataset(data.Dataset):
             # Clip
             new_box[:, [0, 2]] = new_box[:, [0, 2]].clip(0, w)
             new_box[:, [1, 3]] = new_box[:, [1, 3]].clip(0, h)
-            kpt[..., 0] = kpt[..., 0].clip(0, w)
-            kpt[..., 1] = kpt[..., 1].clip(0, h)
+            # Keep transformed coordinates: clamping a point outside the crop
+            # to x=0/y=0 invents a valid target at the image boundary. The PAD
+            # target builder rejects out-of-image points, including after flips.
+            inside = ((kpt[..., 0] >= 0) & (kpt[..., 0] < w)
+                      & (kpt[..., 1] >= 0) & (kpt[..., 1] < h))
+            kpt[..., 2] = np.where(inside, kpt[..., 2], 0)
 
             # 过滤退化框：透视变换可能把目标移出画面，clip 后宽或高 ≤ 1px
             valid_w = (new_box[:, 2] - new_box[:, 0]) > 1

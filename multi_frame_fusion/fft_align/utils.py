@@ -138,26 +138,16 @@ def apply_feature_shift(feat, dx, dy, image_hw, return_mask=False,
     grid_y = (2.0 * src_y + 1.0) / Hf - 1.0
     grid = torch.stack([grid_x, grid_y], dim=-1)
 
-    # CPU 的 half grid_sample 支持不一致；网格跟随实际计算 dtype。
-    compute_feat = feat
-    restore_dtype = None
-    if feat.device.type == 'cpu' and feat.dtype in (torch.float16, torch.bfloat16):
-        restore_dtype = feat.dtype
-        compute_feat = feat.float()
-    grid = grid.to(dtype=compute_feat.dtype)
-    shifted = F.grid_sample(
-        compute_feat, grid, mode=mode, padding_mode='zeros', align_corners=False)
-    if restore_dtype is not None:
-        shifted = shifted.to(dtype=restore_dtype)
-
-    if not return_mask:
-        return shifted
-
-    ones = torch.ones((B, 1, Hf, Wf), device=feat.device,
-                      dtype=compute_feat.dtype)
-    valid_mask = F.grid_sample(
-        ones, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-    valid_mask = valid_mask.clamp_(0.0, 1.0)
-    if restore_dtype is not None:
-        valid_mask = valid_mask.to(dtype=restore_dtype)
-    return shifted, valid_mask
+    # A half-precision normalized grid can round a small learned displacement
+    # back to zero BEFORE autocast promotes grid_sample. Keep geometry in FP32
+    # on CPU and CUDA; autograd still reaches dx/dy through the float conversion.
+    with torch.autocast(device_type=feat.device.type, enabled=False):
+        shifted = F.grid_sample(
+            feat.float(), grid, mode=mode, padding_mode='zeros', align_corners=False)
+        if not return_mask:
+            return shifted.to(dtype=feat.dtype)
+        ones = torch.ones((B, 1, Hf, Wf), device=feat.device, dtype=torch.float32)
+        valid_mask = F.grid_sample(
+            ones, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+        valid_mask = valid_mask.clamp(0.0, 1.0)
+    return shifted.to(dtype=feat.dtype), valid_mask.to(dtype=feat.dtype)

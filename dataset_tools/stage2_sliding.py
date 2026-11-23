@@ -47,6 +47,7 @@ from config import (
     SLIDING_STRIDE,
     SYN_VIZ_SAMPLE_COUNT,
 )
+import common
 from common import (load_labels, save_labels,
                     apply_noises, apply_vibration_blur,
                     apply_overexposure, apply_random_occlusion,
@@ -337,6 +338,10 @@ def process_single_image(img, labels, samples_target, base_seq_idx, dst_dir):
             else:
                 blur_f2 = False
 
+        # 序列级遮挡模式: 50% key_only / 10% refs_only / 40% all
+        common.CURRENT_OCC_MODE = random.choices(
+            ['key_only', 'refs_only', 'all'], weights=[0.5, 0.1, 0.4])[0]
+
         # 施加噪声（传入 blur_flag 控制模糊是否施加）
         frame0_noisy = apply_noises(frame0_img, 0, labels_f0, oe_params,
                                     blur_flag=blur_f0)
@@ -615,6 +620,10 @@ min_labels_keyframe: {MIN_LABELS_FOR_KEYFRAME}
 # ══════════════════════════════════════════════════════════════════════
 
 def main():
+    bank_path = os.environ.get('OCCLUDER_BANK')
+    if bank_path and os.path.exists(bank_path):
+        common.set_patch_bank(np.load(bank_path))
+        print(f'[occluder] patch bank: {bank_path}')
     print("=" * 60)
     print("第二阶段（滑动窗口版）：合成多帧数据集")
     print("  从 2048×2048 源图滑动窗口提取 3 帧序列")

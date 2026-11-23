@@ -37,6 +37,16 @@ from config import (
 )
 
 
+# 自然遮挡 patch bank / 序列级遮挡模式 (由 data builder 设置)
+PATCH_BANK = None
+CURRENT_OCC_MODE = 'all'
+
+
+def set_patch_bank(bank):
+    global PATCH_BANK
+    PATCH_BANK = bank
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 标注加载 / 保存
 # ══════════════════════════════════════════════════════════════════════
@@ -172,39 +182,99 @@ def apply_overexposure(img, params=None):
     return img
 
 
+def _pick_patch():
+    """从训练 patch bank 取一块自然纹理；bank 未设置时用随机噪声兜底."""
+    if PATCH_BANK is not None and len(PATCH_BANK):
+        return PATCH_BANK[random.randrange(len(PATCH_BANK))]
+    base = np.random.randint(40, 200, (128, 128, 3), dtype=np.uint8)
+    return cv2.GaussianBlur(base, (5, 5), 1.0)
+
+
+def _shape_mask(h, w, shape):
+    mask = np.zeros((h, w), np.uint8)
+    if shape == 'poly':
+        n = random.randint(5, 9)
+        pts = []
+        for i in range(n):
+            ang = 2 * np.pi * i / n + random.uniform(-0.15, 0.15)
+            r = random.uniform(0.35, 0.5)
+            pts.append([int(w / 2 + r * w * np.cos(ang)),
+                        int(h / 2 + r * h * np.sin(ang))])
+        cv2.fillPoly(mask, [np.array(pts, np.int32)], 255)
+    else:
+        cv2.ellipse(mask, (w // 2, h // 2), (max(1, w // 2), max(1, h // 2)),
+                    0, 0, 360, 255, -1)
+    return cv2.GaussianBlur(mask, (5, 5), 1.0)
+
+
+def _paste_patch(img, cx, cy, out_w, out_h, angle=0, opacity=1.0):
+    """把自然 patch 以椭圆/多边形 mask 贴到 (cx,cy). 返回 img."""
+    h, w = img.shape[:2]
+    out_w = int(max(8, min(out_w, w - 2)))
+    out_h = int(max(8, min(out_h, h - 2)))
+    # 用一个带旋转的外接矩形画 mask
+    pad = int(np.ceil(np.hypot(out_w, out_h) / 2)) + 3
+    cx_i, cy_i = int(round(cx)), int(round(cy))
+    x1, y1 = cx_i - pad, cy_i - pad
+    x2, y2 = cx_i + pad, cy_i + pad
+    x1c, y1c = max(0, x1), max(0, y1)
+    x2c, y2c = min(w, x2), min(h, y2)
+    if x2c <= x1c or y2c <= y1c:
+        return img
+    mh, mw = y2c - y1c, x2c - x1c
+    local = np.zeros((mh, mw), np.uint8)
+    lcx, lcy = cx_i - x1c, cy_i - y1c
+    shape = 'poly' if random.random() < 0.35 else 'ellipse'
+    if shape == 'poly':
+        n = random.randint(5, 9)
+        pts = []
+        for i in range(n):
+            ang = 2 * np.pi * i / n + random.uniform(-0.2, 0.2)
+            rr = random.uniform(0.32, 0.5)
+            pts.append([int(lcx + rr * out_w * np.cos(ang)),
+                        int(lcy + rr * out_h * np.sin(ang))])
+        cv2.fillPoly(local, [np.array(pts, np.int32)], 255)
+    else:
+        cv2.ellipse(local, (int(lcx), int(lcy)),
+                    (max(1, out_w // 2), max(1, out_h // 2)),
+                    angle, 0, 360, 255, -1)
+    local = cv2.GaussianBlur(local, (5, 5), 1.0)
+    patch = _pick_patch()
+    p = cv2.resize(patch, (mw, mh), interpolation=cv2.INTER_AREA)
+    roi = img[y1c:y2c, x1c:x2c].astype(np.float32)
+    a = (local.astype(np.float32) / 255.0)[..., None] * float(opacity)
+    img[y1c:y2c, x1c:x2c] = np.clip(
+        roi * (1 - a) + p.astype(np.float32) * a, 0, 255).astype(np.uint8)
+    return img
+
+
 def apply_random_occlusion(img):
-    """画面随机位置杂草遮挡"""
+    """画面随机位置自然纹理遮挡."""
     h, w = img.shape[:2]
     n_occlude = random.randint(OCCLUSION_COUNT_MIN, OCCLUSION_COUNT_MAX)
-    result = img.copy().astype(np.float32)
     for _ in range(n_occlude):
-        size = random.randint(OCCLUSION_SIZE_MIN, OCCLUSION_SIZE_MAX)
-        alpha = random.uniform(OCCLUSION_ALPHA_MIN, OCCLUSION_ALPHA_MAX)
-        x = random.randint(0, w - size)
-        y = random.randint(0, h - size)
-        color = (0, random.randint(60, 180), 0)
-        patch = np.ones((size, size, 3), dtype=np.float32)
-        for c in range(3):
-            patch[:, :, c] = color[c]
-        roi = result[y:y + size, x:x + size]
-        result[y:y + size, x:x + size] = (1 - alpha) * roi + alpha * patch
-    return np.clip(result, 0, 255).astype(np.uint8)
+        size_w = random.randint(max(8, OCCLUSION_SIZE_MIN),
+                                max(9, OCCLUSION_SIZE_MAX))
+        size_h = random.randint(max(8, OCCLUSION_SIZE_MIN),
+                                max(9, OCCLUSION_SIZE_MAX))
+        if size_w >= w or size_h >= h:
+            continue
+        cx = random.uniform(size_w / 2, w - size_w / 2)
+        cy = random.uniform(size_h / 2, h - size_h / 2)
+        img = _paste_patch(img, cx, cy, size_w, size_h,
+                           angle=random.uniform(0, 180),
+                           opacity=random.uniform(0.85, 1.0))
+    return img
 
 
 def apply_label_occlusion(img, labels, occlusion_ratio, area_ratio=None,
                           max_size=None, short_side_factor=0.8):
-    """基于标注框的杂草遮挡：
-    按 occlusion_ratio 比例随机选中若干标注框，
-    在每个选中框内放置覆盖约 area_ratio(默认 OCCLUDE_BBOX_AREA_RATIO)面积的遮挡块。
+    """基于真实纹理的标注区域遮挡.
 
-    Args:
-        img: 输入图像
-        labels: 标注列表
-        occlusion_ratio: 选中多少比例的标注框
-        area_ratio: 遮挡块占标注框面积比 (默认模块常量)
-        max_size: 遮挡块最大边长 (默认 OCCLUDE_SIZE_MAX)
-        short_side_factor: 遮挡块边长相对标注框短边的上限系数
-                           (0.8=老行为; 1.0=允许占满短边, 配合高覆盖率)
+    混合三种放置:
+      - centered patch (目标框中心)
+      - offset stripe (中心偏离关键点 20~40px, 细长/椭圆仍覆盖关键点)
+      - 框内随机 patch
     """
     if area_ratio is None:
         area_ratio = OCCLUDE_BBOX_AREA_RATIO
@@ -212,115 +282,97 @@ def apply_label_occlusion(img, labels, occlusion_ratio, area_ratio=None,
         max_size = OCCLUDE_SIZE_MAX
     if short_side_factor is None:
         short_side_factor = 0.8
-
     if len(labels) == 0:
         return img
-
     h, w = img.shape[:2]
-    result = img.copy().astype(np.float32)
-
     n_select = int(np.ceil(len(labels) * occlusion_ratio))
     if n_select <= 0:
         return img
     selected = random.sample(labels, min(n_select, len(labels)))
-
     for lb in selected:
-        # 标注框像素坐标
-        cx_px = lb['cx'] * w
-        cy_px = lb['cy'] * h
-        bw_px = lb['w'] * w
-        bh_px = lb['h'] * h
-
-        # 遮挡块尺寸：占标注框面积的约 area_ratio
-        oc_size = int(np.sqrt(bw_px * bh_px * area_ratio))
-        oc_size = max(8, min(oc_size, max_size,
-                           int(min(bw_px, bh_px) * short_side_factor)))
-
-        # 在标注框内随机放置
-        x_min = max(0, int(cx_px - bw_px / 2))
-        y_min = max(0, int(cy_px - bh_px / 2))
-        x_max = min(w - oc_size, int(cx_px + bw_px / 2) - oc_size)
-        y_max = min(h - oc_size, int(cy_px + bh_px / 2) - oc_size)
-
-        if x_max <= x_min or y_max <= y_min:
-            continue
-
-        ox = random.randint(x_min, x_max)
-        oy = random.randint(y_min, y_max)
-
-        color = (0, random.randint(60, 180), 0)
-
-        result[oy:oy + oc_size, ox:ox + oc_size] = color
-
-    return np.clip(result, 0, 255).astype(np.uint8)
+        cx = lb['cx'] * w
+        cy = lb['cy'] * h
+        bw = max(2.0, lb['w'] * w)
+        bh = max(2.0, lb['h'] * h)
+        kx = lb.get('kx')
+        ky = lb.get('ky')
+        kx = kx * w if kx is not None else cx
+        ky = ky * h if ky is not None else cy
+        base = int(np.sqrt(bw * bh * area_ratio))
+        mode = random.random()
+        if mode < 0.28 and kx is not None:
+            # offset stripe: 中心 20~40px 偏离关键点，长轴穿过关键点
+            d = random.uniform(20, 40)
+            theta = random.uniform(0, 2 * np.pi)
+            ow = random.uniform(2 * d + 20, 2 * d + 60)
+            oh = random.uniform(12, 28)
+            ocx = kx + d * np.cos(theta)
+            ocy = ky + d * np.sin(theta)
+            angle = np.degrees(theta)
+        elif mode < 0.64:
+            # centered-ish patch
+            ow = base
+            oh = base
+            angle = random.uniform(0, 180)
+            ocx = cx + random.uniform(-max(1, bw / 2 - base / 2),
+                                      max(1, bw / 2 - base / 2))
+            ocy = cy + random.uniform(-max(1, bh / 2 - base / 2),
+                                      max(1, bh / 2 - base / 2))
+        else:
+            # random inside box
+            ow = random.uniform(0.45, 1.1) * min(bw, max(12, base))
+            oh = random.uniform(0.45, 1.1) * min(bh, max(12, base))
+            ow = max(8, min(ow, max_size, min(bw, bh) * short_side_factor))
+            oh = max(8, min(oh, max_size, min(bw, bh) * short_side_factor))
+            angle = random.uniform(0, 180)
+            ocx = random.uniform(cx - bw / 2, cx + bw / 2)
+            ocy = random.uniform(cy - bh / 2, cy + bh / 2)
+        if mode < 0.28:
+            ow = min(ow, 160); oh = min(oh, 60)
+        else:
+            ow = min(ow, max_size); oh = min(oh, max_size)
+        img = _paste_patch(img, ocx, ocy, ow, oh, angle=angle,
+                           opacity=random.uniform(0.8, 1.0))
+    return img
 
 
 def apply_background_occlusion(img, labels):
-    """在非标注区域随机放置不透明绿色遮挡块。
-
-    模拟未被标注的杂草（false negative）——模型不应假设每个绿色块都有标注，
-    迫使模型学习真正的杂草视觉特征而非依赖"绿色=杂草"的捷径。
-    遮挡块中心不落在任何标注框内，确保不破坏已有的正样本标注。
-    """
+    """在非标注区域随机放自然纹理遮挡 (不贴整株植物, 只贴纹理块)."""
     h, w = img.shape[:2]
-    result = img.copy()
-
     n_target = random.randint(BG_OCCLUDE_COUNT_MIN, BG_OCCLUDE_COUNT_MAX)
-
-    # 预先计算每个标注框的像素边界，用于碰撞检测
     label_rects = []
     for lb in labels:
         cx = lb['cx'] * w
         cy = lb['cy'] * h
         bw = lb['w'] * w
         bh = lb['h'] * h
-        label_rects.append({
-            'x1': int(cx - bw / 2), 'y1': int(cy - bh / 2),
-            'x2': int(cx + bw / 2), 'y2': int(cy + bh / 2),
-        })
+        label_rects.append({'x1': cx - bw / 2, 'y1': cy - bh / 2,
+                            'x2': cx + bw / 2, 'y2': cy + bh / 2})
 
-    def _is_inside_any_label(x, y, size):
-        """遮挡块中心是否落入任一标注框"""
-        cx_b = x + size / 2
-        cy_b = y + size / 2
-        for r in label_rects:
-            if r['x1'] <= cx_b <= r['x2'] and r['y1'] <= cy_b <= r['y2']:
-                return True
-        return False
+    def inside(x, y, size):
+        cxb, cyb = x + size / 2, y + size / 2
+        return any(r['x1'] <= cxb <= r['x2'] and r['y1'] <= cyb <= r['y2']
+                   for r in label_rects)
 
     placed = 0
-    max_attempts = n_target * 10
-    for _ in range(max_attempts):
+    for _ in range(n_target * 10):
         if placed >= n_target:
             break
-        size = random.randint(BG_OCCLUDE_SIZE_MIN, BG_OCCLUDE_SIZE_MAX)
-        if size >= w or size >= h:
+        size_w = random.randint(max(8, BG_OCCLUDE_SIZE_MIN),
+                                max(9, BG_OCCLUDE_SIZE_MAX))
+        size_h = random.randint(max(8, BG_OCCLUDE_SIZE_MIN),
+                                max(9, BG_OCCLUDE_SIZE_MAX))
+        if size_w >= w or size_h >= h:
             continue
-        x = random.randint(0, w - size)
-        y = random.randint(0, h - size)
-
-        if not _is_inside_any_label(x, y, size):
-            # BGR 绿色，留一定色度变化增加多样性
-            color = (0, random.randint(60, 180), 0)
-            result[y:y + size, x:x + size] = color
-            placed += 1
-
-    return result
-
-
-def apply_vignette(img):
-    """暗角效果"""
-    h, w = img.shape[:2]
-    edge_factor = random.uniform(VIGNETTE_EDGE_MIN, VIGNETTE_EDGE_MAX)
-    y, x = np.ogrid[:h, :w]
-    cx, cy = w / 2, h / 2
-    max_dist = np.sqrt(cx ** 2 + cy ** 2)
-    dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2) / max_dist
-    mask = 1.0 - (1.0 - edge_factor) * np.clip(dist, 0, 1) ** 2
-    result = img.astype(np.float32)
-    for c in range(3):
-        result[:, :, c] *= mask
-    return np.clip(result, 0, 255).astype(np.uint8)
+        cx = random.uniform(size_w / 2, w - size_w / 2)
+        cy = random.uniform(size_h / 2, h - size_h / 2)
+        if inside(cx - size_w / 2, cy - size_h / 2, min(size_w, size_h)):
+            continue
+        img = _paste_patch(img, cx, cy, size_w, size_h,
+                           angle=random.uniform(0, 180),
+                           opacity=random.uniform(0.8, 1.0))
+        placed += 1
+    return img
 
 
 def apply_noises(img, frame_idx, labels, oe_params=None, blur_flag=None,
@@ -358,19 +410,25 @@ def apply_noises(img, frame_idx, labels, oe_params=None, blur_flag=None,
     if random.random() < OVEREXPOSE_PROB:
         img = apply_overexposure(img, oe_params)
 
-    # ── 3. 随机位置杂草遮挡（独立概率 Frame0:30%, Frame1/2:15%）──
+    # ── 3. 遮挡（受序列级 CURRENT_OCC_MODE 控制）──
+    mode = CURRENT_OCC_MODE
+    occ_on = (mode == 'all' or (mode == 'key_only' and frame_idx == 0)
+              or (mode == 'refs_only' and frame_idx > 0))
+    if not occ_on:
+        return img
+
     rand_occ_prob = RANDOM_OCC_PROB_KEYFRAME if frame_idx == 0 else RANDOM_OCC_PROB_REFERENCE
     if random.random() < rand_occ_prob:
         img = apply_random_occlusion(img)
 
-    # ── 4. 标注区域遮挡（始终执行，按配置比例选中标注框）──
+    # ── 4. 标注区域遮挡（按配置比例选中标注框）──
     label_occ_ratio = OCCLUDE_LABEL_RATIO_KEYFRAME if frame_idx == 0 else OCCLUDE_LABEL_RATIO_REFERENCE
     img = apply_label_occlusion(img, labels, label_occ_ratio,
                                 area_ratio=label_occ_area_ratio,
                                 max_size=label_occ_max_size,
                                 short_side_factor=label_occ_short_factor)
 
-    # ── 5. 背景区域不透明遮挡（始终执行）──
+    # ── 5. 背景区域自然纹理遮挡 ──
     img = apply_background_occlusion(img, labels)
 
     return img

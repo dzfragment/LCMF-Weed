@@ -2,7 +2,7 @@
 
 import unittest
 
-from fft_align.consistent import ConsistentAligner
+from multi_frame_fusion.fft_align.consistent import ConsistentAligner
 
 
 class ConsistentAlignerWrapTests(unittest.TestCase):

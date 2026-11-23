@@ -62,6 +62,33 @@ class _NoOp(nn.Module):
         return x
 
 
+class GlobalShiftHead(nn.Module):
+    """Predict one global (dx, dy) residual per reference frame.
+
+    Inputs are the key/ref features at a single pyramid level, after the FFT
+    coarse shift.  The module is deliberately tiny: it predicts **2 numbers**
+    from a concatenated local feature pair, then spatially averages the
+    prediction.  Output is in *feature pixels* of the input level; the caller
+    converts it to image pixels with the level stride.
+
+    `out` is zero-initialised, so a freshly built model is exactly FFT-only.
+    """
+    def __init__(self, in_ch, hidden=32):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch * 2, hidden, 3, 1, 1)
+        self.conv2 = nn.Conv2d(hidden, hidden, 3, 1, 1)
+        self.out = nn.Conv2d(hidden, 2, 3, 1, 1)
+        self.relu = nn.ReLU(inplace=True)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, key, ref):
+        x = torch.cat([key, ref], dim=1)
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        return self.out(x).mean(dim=(2, 3))  # (B, 2) in feature pixels
+
+
 class DeformConvPackV2(nn.Module):
     """DCNv2 wrapper（offset + modulation mask）"""
     def __init__(self, in_ch, out_ch, k=3, stride=1, padding=1):
@@ -186,7 +213,75 @@ class DeformAlignV2(nn.Module):
         mask2 = self.s2_mask(o2).sigmoid()
         aligned2 = self.s2_dcn(aligned1, offset2, mask2)
 
+        # 供跨层 offset 复用（OffsetReuseAlign）读取；两份都是计算图节点，
+        # 目标层复用后梯度会一并回传到本层的 offset predictor。
+        self._last_offset1 = offset1
+        self._last_mask1 = mask1
         return aligned2
+
+
+class OffsetReuseAlign(nn.Module):
+    """跨层复用 DCN offset/mask 的轻量对齐模块。
+
+    只做一次 DCN（不训练 offset predictor）。offset/mask 来自共享层
+    (shared_offset_level) 的 DeformAlignV2 第一级输出，按目标层特征图
+    尺寸双线性缩放，并按层间像素尺度缩放 offset 幅值：
+
+        offset_target = offset_source * (H_target / H_source)
+
+    因为 stride 越小特征图越大，同样的图像位移在细层对应更大的
+    feature-pixel 偏移。
+    """
+
+    def __init__(self, in_ch, reuse_mode='bilinear'):
+        super().__init__()
+        self.reuse_mode = reuse_mode
+        self.dcn = DeformConvPackV2(in_ch, in_ch, 3, padding=1)
+
+    def _offset_mask(self, nbr, src_module=None):
+        """Build the reused (offset, mask) pair for this level."""
+        B, C, H, W = nbr.shape
+        off_s = getattr(src_module, '_last_offset1', None) if src_module is not None else None
+        mask_s = getattr(src_module, '_last_mask1', None) if src_module is not None else None
+        if off_s is None or mask_s is None:
+            # 兜底：没有共享 offset 时退化为普通 conv（offset=0）
+            off = nbr.new_zeros((B, 18, H, W))
+            mask = nbr.new_ones((B, 9, H, W))
+        else:
+            hs, ws = off_s.shape[-2:]
+            # 共享层若是 5x5 DCN（dcn_variant=k5），目标层仍是 3x3：
+            # 取中心 3x3 的 offset/mask，保持初值与 V2 完全一致。
+            if off_s.shape[1] == 50:
+                k = 5
+                centre = [(r + 1) * k + (c + 1)
+                          for r in range(3) for c in range(3)]
+                oidx = torch.cat([torch.tensor([2 * t, 2 * t + 1])
+                                  for t in centre]).to(off_s.device)
+                midx = torch.tensor(centre, device=off_s.device)
+                off_s = off_s.index_select(1, oidx)
+                mask_s = mask_s.index_select(1, midx)
+            if self.reuse_mode == 'global_mean':
+                # 每帧一个全局 (dy,dx) 向量，广播到目标层
+                off = off_s.mean(dim=(2, 3), keepdim=True).expand(-1, -1, H, W)
+                mask = mask_s.mean(dim=(2, 3), keepdim=True).expand(-1, -1, H, W)
+            elif self.reuse_mode == 'nearest':
+                off = F.interpolate(off_s, size=(H, W), mode='nearest')
+                mask = F.interpolate(mask_s, size=(H, W), mode='nearest')
+            elif self.reuse_mode == 'avg_pool':
+                off = F.adaptive_avg_pool2d(off_s, (H, W))
+                mask = F.adaptive_avg_pool2d(mask_s, (H, W))
+            else:  # bilinear per-cell
+                off = F.interpolate(off_s, size=(H, W), mode='bilinear',
+                                    align_corners=True)
+                mask = F.interpolate(mask_s, size=(H, W), mode='bilinear',
+                                     align_corners=True)
+            # 层间像素尺度：P3(128) -> P2(256) 放大 2 倍，P3 -> P4(64) 缩小 0.5
+            off = off * (float(H) / float(hs))
+        return off, mask
+
+    def forward(self, nbr, ref=None, src_module=None):
+        off, mask = self._offset_mask(nbr, src_module)
+        return self.dcn(nbr, off, mask)
 
 
 class DeformAlignV2Triple(DeformAlignV2):
@@ -219,8 +314,11 @@ class DeformAlignV2Triple(DeformAlignV2):
         cat1 = torch.cat([nbr_s, ref_s], dim=1)
         o1 = self.relu(self.s1_conv1(cat1))
         o1 = self.relu(self.s1_conv2(o1))
-        aligned1 = self.s1_dcn(
-            nbr, self.s1_offset(o1), self.s1_mask(o1).sigmoid())
+        offset1 = self.s1_offset(o1)
+        mask1 = self.s1_mask(o1).sigmoid()
+        aligned1 = self.s1_dcn(nbr, offset1, mask1)
+        self._last_offset1 = offset1
+        self._last_mask1 = mask1
 
         cat2 = torch.cat([aligned1, nbr, ref], dim=1)
         o2 = self.relu(self.s2_conv1(cat2))
@@ -281,6 +379,8 @@ class DeformAlignV2Single(nn.Module):
         o1 = self.relu(self.s1_conv2(o1))
         offset1 = self.s1_offset(o1)
         mask1 = self.s1_mask(o1).sigmoid()
+        self._last_offset1 = offset1
+        self._last_mask1 = mask1
         return self.s1_dcn(nbr, offset1, mask1)
 
 
@@ -470,24 +570,22 @@ class AdaptiveFusionTSA(nn.Module):
 # ═══════════════════════════════════════════════════════════
 
 class AdaptiveFusionAvg(nn.Module):
-    """简单平均 + 1×1 投影：等效于 channel gate 固定 0.5。
-    
-    用于验证：concat 输 channel gate 的 0.027 差距是否来自"key 被拼进去"。
+    """Parameter-free arithmetic mean of key and the two aligned references.
+
+    Supplementary avg experiment: unlike the historical residual-projection
+    module with this name, the definition is exactly (key + ref1 + ref2) / 3.
     """
     def __init__(self, channels):
         super().__init__()
-        self.proj = nn.Conv2d(channels, channels, 1, 1, 0)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        self.channels = channels
 
     def forward(self, key, ref1, ref2):
-        fused = ref1 + ref2       # 不拼 key，和 channel gate(0.5) 的 0.5*ref1+0.5*ref2 等效
-        return key + self.proj(fused)
+        return (key + ref1 + ref2) / 3.0
 
     def get_gate_weights(self, key, ref1, ref2):
         B, _, H, W = key.shape
-        return (torch.ones(B,1,H,W,device=key.device)*0.5,
-                torch.ones(B,1,H,W,device=key.device)*0.5)
+        weight = key.new_full((B, 1, H, W), 1.0 / 3.0)
+        return weight, weight.clone()
 
 
 class AdaptiveFusionConcat(nn.Module):
@@ -609,27 +707,57 @@ FUSION_CHANNELS = {
     'p4': 128,
 }
 
+# 不同单帧基座的特征层级/通道配置
+#   p2l:    DarkNetP2_lite  → (p2, p3, p4) = (32, 64, 128), P3+P4 双尺度头
+#           (P2 只经 FPN 融合, 不做 P2 头旁路; 与单帧 PAD p2l 一致)
+#   p2l_p4: DarkNetP2_lite  → (p2, p3, p4) = (32, 64, 128), P4 单尺度头
+#           (旧 YOLO 头配置; PAD 头下与 p2l 同构)
+#   p34l:   DarkNet_lite    → (p3, p4)     = (64, 128),     P3+P4 双尺度头
+BASE_SETTINGS = {
+    'p2l': {
+        'feature_levels': ('p2', 'p3', 'p4'),
+        'fusion_channels': {'p2': 32, 'p3': 64, 'p4': 128},
+        'detect_levels': ('p3', 'p4'),
+    },
+    'p2l_p4': {
+        'feature_levels': ('p2', 'p3', 'p4'),
+        'fusion_channels': {'p2': 32, 'p3': 64, 'p4': 128},
+        'detect_levels': ('p4',),
+    },
+    'p34l': {
+        'feature_levels': ('p3', 'p4'),
+        'fusion_channels': {'p3': 64, 'p4': 128},
+        'detect_levels': ('p3', 'p4'),
+    },
+}
+
 
 def validate_fusion_levels(fusion_levels):
-    """允许 P3、P4 或 P3+P4 融合；P2 因特征图过大明确禁用。"""
+    """允许 P3、P4、P3+P4，以及 P2/P3/P4 全层融合。
+
+    P2 特征图较大 (stride4)，默认不开启；`p2,p3,p4` 用于显式实验
+    （DCN 同时作用于 P2/P3/P4）。
+    """
     levels = list(fusion_levels)
-    allowed = (['p3'], ['p4'], ['p3', 'p4'])
+    allowed = (['p2'], ['p3'], ['p4'], ['p2', 'p3'], ['p3', 'p4'],
+               ['p2', 'p4'], ['p2', 'p3', 'p4'])
     if levels not in allowed:
         raise ValueError(
-            'P2L-P4 基座仅支持 fusion_levels=p3、p4 或 p3,p4，'
-            f'收到 fusion_levels={levels}')
+            f'不支持的 fusion_levels={levels}')
     return levels
 
 
 def _alignment_loss_impl(fusion_levels, align_ref1, align_ref2,
                           last_aligned_r1, last_aligned_r2,
-                          key_feats, ref1_feats, ref2_feats):
+                          key_feats, ref1_feats, ref2_feats, level_to_idx=None):
     """get_alignment_loss 共享实现，供 MultiFrameFusionV2/V3 复用。"""
+    if level_to_idx is None:
+        level_to_idx = LEVEL_TO_IDX
     total_loss = 0.0
     count = 0
 
     for level in fusion_levels:
-        idx = LEVEL_TO_IDX[level]
+        idx = level_to_idx[level]
 
         if level in last_aligned_r1 and level in last_aligned_r2:
             aligned1 = last_aligned_r1[level]
@@ -666,14 +794,29 @@ class MultiFrameFusionV2(nn.Module):
     def __init__(self, fusion_levels=None, align_hidden_ch=None, use_sharpener=False,
                  fusion_gate_type='channel', gate_init_bias=-2.0,
                  gate_use_diff=True, fusion_mode='gate', no_align=False,
-                 cascade_align=False, convgru_kernel=3, convgru_layers=1):
+                 cascade_align=False, convgru_kernel=3, convgru_layers=1,
+                 feature_levels=None, fusion_channels=None,
+                 shared_offset_level=None, offset_reuse_mode='bilinear'):
         super().__init__()
         if fusion_levels is None:
             fusion_levels = ['p4']
         self.fusion_levels = validate_fusion_levels(fusion_levels)
+        self.feature_levels = tuple(feature_levels) if feature_levels else FEATURE_LEVELS
+        self.level_to_idx = {level: idx for idx, level in enumerate(self.feature_levels)}
+        self.fusion_channels = fusion_channels if fusion_channels else FUSION_CHANNELS
         self.fusion_gate_type = fusion_gate_type
         self.no_align = no_align
         self.cascade_align = cascade_align
+        if shared_offset_level in ('', 'none'):
+            shared_offset_level = None
+        if shared_offset_level is not None and shared_offset_level not in self.fusion_levels:
+            raise ValueError(
+                f'shared_offset_level={shared_offset_level!r} 不在 fusion_levels='
+                f'{self.fusion_levels} 中')
+        self.shared_offset_level = shared_offset_level
+        if offset_reuse_mode not in ('bilinear', 'nearest', 'global_mean', 'avg_pool'):
+            raise ValueError(f'unknown offset_reuse_mode={offset_reuse_mode!r}')
+        self.offset_reuse_mode = offset_reuse_mode
 
         if fusion_gate_type == 'concat':
             fusion_cls = AdaptiveFusionConcat
@@ -711,10 +854,14 @@ class MultiFrameFusionV2(nn.Module):
         self._last_aligned_r2 = {}
 
         for level in fusion_levels:
-            ch = FUSION_CHANNELS[level]
+            ch = self.fusion_channels[level]
             if no_align:
                 self.align_ref1[level] = _NoOp()
                 self.align_ref2[level] = _NoOp()
+            elif shared_offset_level is not None and level != shared_offset_level:
+                # 只在该层做一次轻量 DCN，offset/mask 从共享层复用
+                self.align_ref1[level] = OffsetReuseAlign(ch, reuse_mode=offset_reuse_mode)
+                self.align_ref2[level] = OffsetReuseAlign(ch, reuse_mode=offset_reuse_mode)
             else:
                 self.align_ref1[level] = DeformAlignV2(ch, align_hidden_ch, use_sharpener=use_sharpener)
                 self.align_ref2[level] = DeformAlignV2(ch, align_hidden_ch, use_sharpener=use_sharpener)
@@ -722,20 +869,32 @@ class MultiFrameFusionV2(nn.Module):
 
     def forward(self, key_feats, ref1_feats, ref2_feats):
         """
-        key_feats/ref1_feats/ref2_feats: tuple of (p2, p3, p4)
-        返回: tuple of (key_p2, temporal_p3, temporal_p4)，未选层保持关键帧特征
+        key_feats/ref1_feats/ref2_feats: 按 self.feature_levels 顺序的特征元组
+        返回: 同序元组，未选层保持关键帧特征
         副作用: 缓存所选融合层的对齐后特征
         """
         fused = list(key_feats)
 
-        for level in self.fusion_levels:
-            idx = LEVEL_TO_IDX[level]
+        # 共享 offset 时先算共享层，再算复用层
+        order = list(self.fusion_levels)
+        if self.shared_offset_level is not None:
+            order = [self.shared_offset_level] + [
+                l for l in order if l != self.shared_offset_level]
+        src1 = src2 = None
+        for level in order:
+            idx = self.level_to_idx[level]
             key = key_feats[idx]
             ref1 = ref1_feats[idx]
             ref2 = ref2_feats[idx]
 
-            aligned1 = self.align_ref1[level](ref1, key)
-            aligned2 = self.align_ref2[level](ref2, key)
+            if isinstance(self.align_ref1[level], OffsetReuseAlign):
+                aligned1 = self.align_ref1[level](ref1, key, src_module=src1)
+                aligned2 = self.align_ref2[level](ref2, key, src_module=src2)
+            else:
+                aligned1 = self.align_ref1[level](ref1, key)
+                aligned2 = self.align_ref2[level](ref2, key)
+            if level == self.shared_offset_level:
+                src1, src2 = self.align_ref1[level], self.align_ref2[level]
             self._last_aligned_r1[level] = aligned1
             self._last_aligned_r2[level] = aligned2
             fused[idx] = self.fusion[level](key, aligned1, aligned2)
@@ -747,7 +906,7 @@ class MultiFrameFusionV2(nn.Module):
         return _alignment_loss_impl(
             self.fusion_levels, self.align_ref1, self.align_ref2,
             self._last_aligned_r1, self._last_aligned_r2,
-            key_feats, ref1_feats, ref2_feats)
+            key_feats, ref1_feats, ref2_feats, level_to_idx=self.level_to_idx)
 
     def get_aligned_features(self):
         """
@@ -788,7 +947,8 @@ class MultiFrameFusionV3(nn.Module):
     def __init__(self, fusion_levels=None, align_mode=None,
                  align_hidden_ch=None, pcd_num_feat=64, use_sharpener=False,
                  fusion_gate_type='channel', gate_init_bias=-2.0,
-                 gate_use_diff=True, fusion_mode='gate', no_align=False):
+                 gate_use_diff=True, fusion_mode='gate', no_align=False,
+                 feature_levels=None, fusion_channels=None):
         super().__init__()
         if fusion_levels is None:
             fusion_levels = ['p4']
@@ -796,6 +956,9 @@ class MultiFrameFusionV3(nn.Module):
         if align_mode is None:
             align_mode = {l: 'hybrid' for l in fusion_levels}
         self.fusion_levels = fusion_levels
+        self.feature_levels = tuple(feature_levels) if feature_levels else FEATURE_LEVELS
+        self.level_to_idx = {level: idx for idx, level in enumerate(self.feature_levels)}
+        self.fusion_channels = fusion_channels if fusion_channels else FUSION_CHANNELS
         self.align_mode = align_mode
         self.fusion_gate_type = fusion_gate_type
         self.no_align = no_align
@@ -816,7 +979,7 @@ class MultiFrameFusionV3(nn.Module):
         self._last_aligned_r2 = {}
 
         for level in fusion_levels:
-            ch = FUSION_CHANNELS[level]
+            ch = self.fusion_channels[level]
             mode = align_mode.get(level, 'dav2')
             if no_align:
                 self.align_ref1[level] = _NoOp()
@@ -855,7 +1018,7 @@ class MultiFrameFusionV3(nn.Module):
         fused = list(key_feats)
 
         for level in self.fusion_levels:
-            idx = LEVEL_TO_IDX[level]
+            idx = self.level_to_idx[level]
             key = key_feats[idx]
             ref1 = ref1_feats[idx]
             ref2 = ref2_feats[idx]
@@ -873,7 +1036,7 @@ class MultiFrameFusionV3(nn.Module):
         return _alignment_loss_impl(
             self.fusion_levels, self.align_ref1, self.align_ref2,
             self._last_aligned_r1, self._last_aligned_r2,
-            key_feats, ref1_feats, ref2_feats)
+            key_feats, ref1_feats, ref2_feats, level_to_idx=self.level_to_idx)
 
     def get_aligned_features(self):
         """

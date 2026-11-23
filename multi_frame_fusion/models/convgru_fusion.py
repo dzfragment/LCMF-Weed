@@ -101,7 +101,7 @@ class ConvGRUFusion(nn.Module):
         return out
 
 
-def get_gate_weights_for_convgru(self, key, ref1, ref2):
+def get_gate_weights_for_convgru(key, ref1, ref2):
     """ConvGRU模式下不需要gate权重（权重组装兼容接口）"""
     B, C, H, W = key.shape
     return (

@@ -17,8 +17,10 @@ _YOLO_PATH = os.path.join(os.path.dirname(__file__), '../../YOLOv8-pose')
 if _YOLO_PATH not in sys.path:
     sys.path.insert(0, _YOLO_PATH)
 
-from nets.nn import DarkNetP2_lite, DarkFPN_P2_lite, Head
-from .modules import FEATURE_LEVELS, LEVEL_TO_IDX, MultiFrameFusion, MultiFrameFusionV3
+from nets.nn import DarkNetP2_lite, DarkFPN_P2_lite, DarkNet_lite, DarkFPN_lite, Head
+from pad_core import build_point_head, normalize_head_cfg
+from .modules import (FEATURE_LEVELS, LEVEL_TO_IDX, BASE_SETTINGS,
+                      MultiFrameFusion, MultiFrameFusionV3)
 
 
 class MultiFrameYOLO(nn.Module):
@@ -38,19 +40,47 @@ class MultiFrameYOLO(nn.Module):
                  gate_init_bias=-2.0, convgru_kernel=3, convgru_layers=1,
                  global_align_stage='none', fft_downsample=4,
                  fft_chain_align=True, fft_mse_check=True, fft_normalize=True,
-                 consistent_align=False):
+                 consistent_align=False, base_model='p2l_p4',
+                 pad_head=False, pad_head_cfg=None, offset_reuse_mode='bilinear',
+                 global_head=False, global_head_level='p3',
+                 global_head_hidden=32, global_head_max_shift=32.0):
         super().__init__()
+        if base_model not in BASE_SETTINGS:
+            raise ValueError(
+                f'base_model 仅支持 {sorted(BASE_SETTINGS)}，收到 {base_model!r}')
+        self.base_model = base_model
+        base_cfg = BASE_SETTINGS[base_model]
         if fusion_levels is None:
             fusion_levels = ['p4']
         fusion_levels = list(fusion_levels)
-        if fusion_levels not in (['p3'], ['p4'], ['p3', 'p4']):
+        if fusion_levels not in (['p2'], ['p3'], ['p4'], ['p2', 'p3'],
+                                 ['p3', 'p4'], ['p2', 'p4'],
+                                 ['p2', 'p3', 'p4']):
             raise ValueError(
-                'P2L-P4 多帧模型仅支持 p3、p4 或 p3,p4 融合，'
+                '多帧模型支持 p2/p3/p4 的单层、双、三层融合，'
                 f'收到 fusion_levels={fusion_levels}')
         self.fusion_levels = fusion_levels
-        self.feature_levels = FEATURE_LEVELS
-        self.detect_levels = ('p4',)
+        self.feature_levels = base_cfg['feature_levels']
+        self.level_to_idx = {level: idx for idx, level in enumerate(self.feature_levels)}
+        self.fusion_channels = base_cfg['fusion_channels']
+        self.detect_levels = base_cfg['detect_levels']
         self.kpt_shape = tuple(kpt_shape)
+        self.global_head_enabled = bool(global_head)
+        self.global_head_level = global_head_level
+        self.global_head_hidden = int(global_head_hidden)
+        self.global_head_max_shift = float(global_head_max_shift)
+        if global_head:
+            if global_head_level not in self.feature_levels:
+                raise ValueError(
+                    f'global_head_level={global_head_level!r} 不在 '
+                    f'feature_levels={self.feature_levels} 中')
+            from .modules import GlobalShiftHead
+            ch = self.fusion_channels[global_head_level]
+            self.global_head_r1 = GlobalShiftHead(ch, global_head_hidden)
+            self.global_head_r2 = GlobalShiftHead(ch, global_head_hidden)
+        else:
+            self.global_head_r1 = None
+            self.global_head_r2 = None
         self.fusion_version = fusion_version
         self.use_sharpener = use_sharpener
         self.align_hidden_ch = align_hidden_ch
@@ -100,13 +130,11 @@ class MultiFrameYOLO(nn.Module):
         self._last_raw_ref2_feats = None
         self._last_fft_displacements = None
         self._last_fft_valid_masks = None
+        self._last_global_shift = None
 
         # 与单帧 YOLO_P2_lite_P4 相同的架构超参
         width = [3, 16, 32, 64, 128, 256]
         depth = [1, 2, 2]
-
-        # 共享 P2L backbone，输出 P2/P3/P4
-        self.backbone = DarkNetP2_lite(width, depth)
 
         # 多帧融合模块
         if fusion_version == 3:
@@ -116,31 +144,56 @@ class MultiFrameYOLO(nn.Module):
                                               fusion_gate_type=fusion_gate_type,
                                               gate_init_bias=gate_init_bias,
                                               convgru_kernel=convgru_kernel,
-                                              convgru_layers=convgru_layers)
+                                              convgru_layers=convgru_layers,
+                                              feature_levels=self.feature_levels,
+                                              fusion_channels=self.fusion_channels)
         else:
             self.fusion = MultiFrameFusion(fusion_levels, align_hidden_ch=align_hidden_ch,
                                             use_sharpener=use_sharpener,
                                             fusion_gate_type=fusion_gate_type,
                                             gate_init_bias=gate_init_bias,
                                             convgru_kernel=convgru_kernel,
-                                            convgru_layers=convgru_layers)
+                                            convgru_layers=convgru_layers,
+                                            feature_levels=self.feature_levels,
+                                            fusion_channels=self.fusion_channels,
+                                            offset_reuse_mode=offset_reuse_mode)
 
-        # P2L FPN 接收 P2/P3/P4，输出 N3/N4
-        self.fpn = DarkFPN_P2_lite(width, depth)
+        # 共享 backbone + FPN（按基座选择），输出 N3/N4
+        if base_model in ('p2l', 'p2l_p4'):
+            self.backbone = DarkNetP2_lite(width, depth)
+            self.fpn = DarkFPN_P2_lite(width, depth)
+        else:  # p34l
+            self.backbone = DarkNet_lite(width, depth)
+            self.fpn = DarkFPN_lite(width, depth)
 
-        # 仅保留 P4 检测头
-        self.head = Head(num_classes, kpt_shape, (width[4],))
+        # 检测头：p2l_p4 仅 P4 单尺度；p2l/p34l 为 P3+P4 双尺度
+        # pad_head=True 时替换为 PAD 点热图头（点锚定，不使用 TAL/DFL）
+        self.pad_head = bool(pad_head)
+        self.pad_head_cfg = normalize_head_cfg(pad_head_cfg) if self.pad_head else None
+        if self.pad_head:
+            if self.pad_head_cfg['use_p2'] and base_model not in ('p2l', 'p2l_p4'):
+                raise ValueError(
+                    'PAD use_p2 需要 backbone 的 P2 特征，仅支持 '
+                    'base_model=p2l/p2l_p4')
+            head_ch = (width[3], width[4])
+            self.head = build_point_head(head_ch, self.pad_head_cfg)
+            self.stride = torch.tensor(
+                [4.0 if self.pad_head_cfg['out_stride4'] else 8.0])
+            self.head.stride = self.stride
+        else:
+            head_ch = (width[4],) if base_model == 'p2l_p4' else (width[3], width[4])
+            self.head = Head(num_classes, kpt_shape, head_ch)
 
-        # 计算单尺度 stride
-        img_dummy = torch.zeros(1, 3, 256, 256)
-        _, n4 = self.fpn(self.backbone(img_dummy))
-        self.head.stride = torch.tensor([256 / n4.shape[-2]])
-        self.stride = self.head.stride
-        self.head.initialize_biases()
+            # 计算 stride（与 detect_forward 的选层一致）
+            img_dummy = torch.zeros(1, 3, 256, 256)
+            detect_feats = self._select_detect_feats(self.fpn(self.backbone(img_dummy)))
+            self.head.stride = torch.tensor([256 / x.shape[-2] for x in detect_feats])
+            self.stride = self.head.stride
+            self.head.initialize_biases()
 
-        # 严格冻结 DFL 卷积权重（与原始 YOLO 一致）
-        if hasattr(self.head, 'dfl') and hasattr(self.head.dfl, 'conv'):
-            self.head.dfl.conv.weight.requires_grad_(False)
+            # 严格冻结 DFL 卷积权重（与原始 YOLO 一致）
+            if hasattr(self.head, 'dfl') and hasattr(self.head.dfl, 'conv'):
+                self.head.dfl.conv.weight.requires_grad_(False)
 
         # 加载预训练权重
         if pretrained_path is not None:
@@ -214,6 +267,40 @@ class MultiFrameYOLO(nn.Module):
             ref2_feats = tuple(shifted_r2)
             valid_masks = {'ref1': tuple(masks_r1), 'ref2': tuple(masks_r2)}
 
+        # Optional learned global residual: predict one (dx,dy) per reference
+        # from the post-FFT feature pair and apply it to every fused level.
+        # This is deliberately separate from DCN's per-pixel local offsets.
+        global_shift = None
+        if self.global_head_r1 is not None:
+            from .fft_align import apply_feature_shift
+            idx = self.level_to_idx[self.global_head_level]
+            key_l = key_feats[idx]
+            Hf, Wf = ref1_feats[idx].shape[-2:]
+            stride_x = float(image_hw[1]) / float(Wf)
+            stride_y = float(image_hw[0]) / float(Hf)
+            d1 = self.global_head_r1(key_l, ref1_feats[idx])  # (B,2) feat px
+            d2 = self.global_head_r2(key_l, ref2_feats[idx])
+            mx = self.global_head_max_shift
+            dx1_g = torch.clamp(d1[:, 0] * stride_x, -mx, mx)
+            dy1_g = torch.clamp(d1[:, 1] * stride_y, -mx, mx)
+            dx2_g = torch.clamp(d2[:, 0] * stride_x, -mx, mx)
+            dy2_g = torch.clamp(d2[:, 1] * stride_y, -mx, mx)
+            new_r1, new_r2 = [], []
+            for f in ref1_feats:
+                sf, _ = apply_feature_shift(f, dx1_g, dy1_g, image_hw,
+                                            return_mask=True)
+                new_r1.append(sf)
+            for f in ref2_feats:
+                sf, _ = apply_feature_shift(f, dx2_g, dy2_g, image_hw,
+                                            return_mask=True)
+                new_r2.append(sf)
+            ref1_feats = tuple(new_r1)
+            ref2_feats = tuple(new_r2)
+            global_shift = {
+                'ref1': {'dx': dx1_g, 'dy': dy1_g},
+                'ref2': {'dx': dx2_g, 'dy': dy2_g},
+            }
+
         self._last_key_feats = tuple(key_feats)
         self._last_raw_ref1_feats = tuple(raw_ref1_feats)
         self._last_raw_ref2_feats = tuple(raw_ref2_feats)
@@ -221,8 +308,27 @@ class MultiFrameYOLO(nn.Module):
         self._last_ref2_feats = tuple(ref2_feats)
         self._last_fft_displacements = displacement
         self._last_fft_valid_masks = valid_masks
+        self._last_global_shift = global_shift
         return (self._last_key_feats, self._last_ref1_feats, self._last_ref2_feats,
                 self._last_raw_ref1_feats, self._last_raw_ref2_feats)
+
+    def _select_detect_feats(self, fpn_feats):
+        """从 FPN 输出 (n3, n4) 中选出送入检测头的层（按基座配置）。"""
+        if self.detect_levels == ('p4',):
+            return [fpn_feats[1]]
+        return [fpn_feats[0], fpn_feats[1]]
+
+    def detect_forward(self, fused, p2=None):
+        """融合特征 → FPN → 检测头（p2l_p4 用 N4，p2l/p34l 用 N3+N4）。
+
+        PAD 头使用 FPN 的 N3+N4 两个尺度（可选 key 帧的 P2 细节）。
+        """
+        n3, n4 = self.fpn(fused)
+        if self.pad_head:
+            if self.pad_head_cfg['head_type'] == 'ms':
+                return self.head([n3, n4], p2)
+            return self.head(n3)
+        return self.head(self._select_detect_feats((n3, n4)))
 
     def forward(self, frames):
         """
@@ -232,8 +338,10 @@ class MultiFrameYOLO(nn.Module):
         key_feats, ref1_feats, ref2_feats, _, _ = \
             self._extract_multiframe_features(frames)
         fused = self.fusion(key_feats, ref1_feats, ref2_feats)
-        _, n4 = self.fpn(fused)
-        return self.head([n4])
+        p2 = None
+        if self.pad_head and self.pad_head_cfg['use_p2']:
+            p2 = key_feats[self.level_to_idx['p2']]
+        return self.detect_forward(fused, p2)
 
     def forward_with_features(self, frames):
         """
@@ -248,11 +356,12 @@ class MultiFrameYOLO(nn.Module):
         """
         (key_feats, ref1_feats, ref2_feats,
          raw_ref1_feats, raw_ref2_feats) = self._extract_multiframe_features(frames)
-        key_by_level = dict(zip(FEATURE_LEVELS, key_feats))
-        ref1_by_level = dict(zip(FEATURE_LEVELS, ref1_feats))
-        ref2_by_level = dict(zip(FEATURE_LEVELS, ref2_feats))
-        raw_ref1_by_level = dict(zip(FEATURE_LEVELS, raw_ref1_feats))
-        raw_ref2_by_level = dict(zip(FEATURE_LEVELS, raw_ref2_feats))
+        levels = self.feature_levels
+        key_by_level = dict(zip(levels, key_feats))
+        ref1_by_level = dict(zip(levels, ref1_feats))
+        ref2_by_level = dict(zip(levels, ref2_feats))
+        raw_ref1_by_level = dict(zip(levels, raw_ref1_feats))
+        raw_ref2_by_level = dict(zip(levels, raw_ref2_feats))
 
         # 统一调用 fusion.forward()，避免逻辑漂移
         fused = self.fusion(key_feats, ref1_feats, ref2_feats)
@@ -260,14 +369,24 @@ class MultiFrameYOLO(nn.Module):
         # 从 fusion 公开接口读取对齐后特征（避免直接访问私有缓存）
         aligned_r1, aligned_r2 = self.fusion.get_aligned_features()
 
-        fused_feats = dict(zip(FEATURE_LEVELS, fused))
+        fused_feats = dict(zip(levels, fused))
 
         n3, n4 = self.fpn(fused)
-        outputs = self.head([n4])
+        if self.pad_head:
+            p2 = (key_feats[self.level_to_idx['p2']]
+                  if self.pad_head_cfg['use_p2'] else None)
+            if self.pad_head_cfg['head_type'] == 'ms':
+                outputs = self.head([n3, n4], p2)
+            else:
+                outputs = self.head(n3)
+            detect_feats = [n3, n4]
+        else:
+            detect_feats = self._select_detect_feats((n3, n4))
+            outputs = self.head(detect_feats)
 
         features = {
             'key': key_by_level,
-            # ref1/ref2 表示进入 P4 DCN 前的三层特征。
+            # ref1/ref2 表示进入 DCN 前的各层特征。
             'ref1': ref1_by_level,
             'ref2': ref2_by_level,
             'raw_ref1': raw_ref1_by_level,
@@ -282,7 +401,7 @@ class MultiFrameYOLO(nn.Module):
             'aligned_r2': aligned_r2,
             'fused': fused_feats,
             'fpn': {'p3': n3, 'p4': n4},
-            'detect': {'p4': n4},
+            'detect': dict(zip(self.detect_levels, detect_feats)),
         }
         return outputs, features
 
@@ -335,11 +454,11 @@ class MultiFrameYOLO(nn.Module):
             and ('backbone.' + k[4:] if k.startswith('net.') else k) not in base_keys)
         if missing_base or unexpected_base:
             raise RuntimeError(
-                '预训练权重与 YOLO_P2_lite_P4 基座不匹配: '
+                f'预训练权重与 {self.base_model} 基座不匹配: '
                 f'missing={missing_base[:5]} ({len(missing_base)}), '
                 f'unexpected={unexpected_base[:5]} ({len(unexpected_base)})')
         self.load_state_dict(loaded, strict=False)
-        print(f'[MultiFrameYOLO] P2L-P4 基座权重完整加载: {len(loaded)}/{len(base_keys)}')
+        print(f'[MultiFrameYOLO] {self.base_model} 基座权重完整加载: {len(loaded)}/{len(base_keys)}')
 
     def get_alignment_loss(self, frames=None):
         """
@@ -391,7 +510,8 @@ def create_model(num_classes=1, kpt_shape=(1, 2), fusion_levels=None,
                  pretrained_path=None, device='cuda',
                  fusion_version=2, align_mode=None, use_sharpener=False,
                  align_hidden_ch=None, fusion_gate_type='channel',
-                 global_align_stage='none', fft_downsample=4):
+                 global_align_stage='none', fft_downsample=4,
+                 base_model='p2l_p4'):
     """工厂函数：创建 MultiFrameYOLO 模型并移到指定设备
 
     fusion_version: 2 (DeformAlignV2) 或 3 (HybridAlign)
@@ -399,6 +519,8 @@ def create_model(num_classes=1, kpt_shape=(1, 2), fusion_levels=None,
     use_sharpener: 是否在 DeformAlignV2 输入前加特征锐化层
     align_hidden_ch: DeformAlignV2 offset predictor 隐藏通道数（默认 min(96, in_ch*2)）
     fusion_gate_type: 'channel'（per-channel gate）或 'spatial'（per-pixel gate）
+    base_model: 'p2l'（P2/P3/P4 backbone + P3/P4 头）、
+                'p2l_p4'（同 backbone + P4 单头）或 'p34l'（P3/P4 backbone + P3/P4 头）
     """
     model = MultiFrameYOLO(
         num_classes=num_classes,
@@ -412,6 +534,7 @@ def create_model(num_classes=1, kpt_shape=(1, 2), fusion_levels=None,
         fusion_gate_type=fusion_gate_type,
         global_align_stage=global_align_stage,
         fft_downsample=fft_downsample,
+        base_model=base_model,
     )
     model = model.to(device)
     return model
@@ -477,6 +600,9 @@ class StreamingInference:
                 '请使用普通三帧推理，避免静默跳过 feature FFT 对齐。')
 
         key_feats = self.model.backbone(key_img)
+        p2 = None
+        if self.model.pad_head and self.model.pad_head_cfg['use_p2']:
+            p2 = key_feats[self.model.level_to_idx['p2']]
 
         # 从缓存取历史特征：ref1=前1帧, ref2=前2帧
         if len(self.buffer) >= 2:
@@ -490,8 +616,7 @@ class StreamingInference:
             ref2_feats = key_feats
 
         fused = self.model.fusion(key_feats, ref1_feats, ref2_feats)
-        _, n4 = self.model.fpn(fused)
-        return self.model.head([n4])
+        return self.model.detect_forward(fused, p2)
 
     def update_cache(self, img):
         """
